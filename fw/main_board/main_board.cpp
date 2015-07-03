@@ -32,13 +32,14 @@ using avrlib::format_spgm;
 using avrlib::send;
 using avrlib::send_spgm;
 using avrlib::string;
+using avrlib::clamp;
 
 #define nop() __asm__ volatile ("nop")
 
 // usarts
 
-typedef avrlib::async_usart<avrlib::uart_xmega, 16, 128, avrlib::nobootseq, uint8_t> debug_type;
-debug_type debug;
+typedef avrlib::async_usart<avrlib::uart_xmega, 16, 128, avrlib::nobootseq, uint8_t> debug_port_type;
+debug_port_type debug;
 ISR(debug_usart_rxc_vect) { debug.intr_rx(); }
 	
 typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, avrlib::nobootseq, uint8_t> bluetooth_port_type;
@@ -56,63 +57,15 @@ ISR(position_sensor_usart_rxc_vect) { position_sensor_port.intr_rx(); }
 typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, avrlib::nobootseq, uint8_t> driver_port_type;
 driver_port_type driver_port;
 ISR(driver_usart_rxc_vect) { driver_port.intr_rx(); }
+ISR(driver_usart_dre_vect) { driver_port.intr_tx(); }
 	
 typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, avrlib::nobootseq, uint8_t> rs485_type;
 rs485_type rs485;
 ISR(rs485_usart_rxc_vect) { rs485.intr_rx(); }
-	
-	
-// timing
-	
-AVRLIB_XMEGA_TIMER(timerc0, TCC0);
-typedef avrlib::counter<timerc0, uint32_t, uint32_t, false> base_timer_type;
-base_timer_type base_timer;
-ISR(TCC0_OVF_vect) { base_timer.tov_interrupt(); }
 
-struct stopwatch
-	:avrlib::stopwatch<base_timer_type>
-{
-	stopwatch(bool run = true)
-		:avrlib::stopwatch<base_timer_type>(base_timer)
-	{
-		if(run)
-			return;
-		stop();
-		clear();
-	}
-};
 
-struct timeout
-	:avrlib::timeout<base_timer_type>
-{
-	timeout(avrlib::timeout<base_timer_type>::time_type timeout)
-		:avrlib::timeout<base_timer_type>(base_timer, timeout)
-	{
-	}
-};
-
-void wait(base_timer_type::time_type time)
-{
-	avrlib::wait(base_timer, time);
-}
-
-template <typename Process>
-void wait(base_timer_type::time_type time, Process process)
-{
-	avrlib::wait(base_timer, time, process);
-}
-
-template <typename Process>
-void wait(base_timer_type::time_type time, Process process, int)
-{
-	avrlib::wait(base_timer, time, process, 0);
-}
-
-#define  sec(value) (32000000UL*value)
-#define msec(value) (32000UL*value)
-#define usec(value) (32UL*value)
-
-// main
+#include "time.hpp"
+#include "roboclaw.hpp"
 
 typedef led0_pin led0;
 
@@ -127,6 +80,7 @@ int main(void)
 	led0::make_high(); // only alias for led0_pin
 	
 	pwr_en::make_high();
+	pwr_en::pinctrl(PORT_OPC_WIREDANDPULL_gc);
 	
 	off_btn::pullup();
 	off_btn::make_inverted();
@@ -185,10 +139,11 @@ int main(void)
 	DFLLRC32M.CTRL = DFLL_ENABLE_bm;
 	    
 	debug.usart().open(debug_usart							, (-3<<12)|131, true);
-	bluetooth_port.usart().open(bluetooth_usart				, (-3<<12)|131, true);
+	bluetooth_port.usart().open(bluetooth_usart				, (-3<<12)|131, true); // 115200
 	controller_port.usart().open(controller_usart			, (-3<<12)|131, true);
 	position_sensor_port.usart().open(position_sensor_usart	, (-3<<12)|131, true);
-	driver_port.usart().open(driver_usart					, ( 2<<12)| 12, true);
+	driver_port.usart().open(driver_usart					, ( 2<<12)| 12, true); // 38400
+	driver_port.async_tx(true);
 	rs485.usart().open(rs485_usart							, (-3<<12)|131, true);
 	_delay_ms(1);
 	
@@ -204,6 +159,21 @@ int main(void)
 	
 	led0::set_low();
 	
+	ss::pullup();
+	mosi::make_low();
+	miso::pulldown();
+	sck::make_low();
+	
+	left_enc_cs::make_low();
+	wait(msec(1));
+	left_enc_cs::set_high();
+	wait(usec(1));
+	right_enc_cs::make_low();
+	wait(msec(1));
+	right_enc_cs::set_high();
+	
+	roboclaw_t<driver_port_type> motors(driver_port, 128);
+	
 	timeout second_timeout(sec(1));
 	
 	char ch = 0;
@@ -213,6 +183,15 @@ int main(void)
 	
 	timeout off_timeout(sec(3));
 	off_timeout.cancel();
+	
+	avrlib::timed_command_parser<base_timer_type> cmd_parser(base_timer, msec(10));
+	
+	timeout emergency_brake_timeout(msec(500));
+	emergency_brake_timeout.force();
+	
+	timeout led_send_delay(msec(200));
+	
+	motors.set_pwm_resolution(motors.pwm_10bit);
 	
 	for(;;)
 	{
@@ -259,9 +238,76 @@ int main(void)
 			}
 		}
 		
+		if(!driver_port.empty())
+		{
+			format(debug, "rec %x2 \n") % uint8_t(driver_port.read());
+		}
+		
 		if (!bluetooth_port.empty())
 		{
-			debug.write(bluetooth_port.read());
+			ch = bluetooth_port.read();
+			switch(cmd_parser.push_data(ch))
+			{
+			case 1:
+				if(cmd_parser.size() == 9)
+				{
+					int8_t fwd = cmd_parser[3];
+					int8_t cross = cmd_parser[1];
+
+					if (fwd < -8)
+						fwd += 8;
+					else if (fwd > 8)
+						fwd -= 8;
+					else
+						fwd = 0;
+
+					if (cross < -8)
+						cross += 8;
+					else if (cross > 8)
+						cross -= 8;
+					else
+						cross = 0;
+
+					cross /= 2;
+
+					uint8_t buttons = cmd_parser[8];
+
+					uint8_t slowGetter = 0;
+					if((buttons & (1<<2)) != 0 && (buttons & (1<<3)) != 0)
+						slowGetter = 0;
+					else if((buttons & (1<<2)) == 0 && (buttons & (1<<3)) == 0)
+						slowGetter = 2;
+					else
+						slowGetter = 1;
+						
+					int16_t left_target = clamp((fwd + cross) * 8, -1023, 1023);
+					int16_t right_target = clamp((fwd - cross) * 8, -1023, 1023);
+					
+					motors.set_left_power ( left_target >> slowGetter/*, (buttons & 1) == 0*/);
+					motors.set_right_power(right_target >> slowGetter/*, (buttons & 1) == 0*/);
+					
+					emergency_brake_timeout.restart();
+				}
+				break;
+					
+				default:
+					emergency_brake_timeout.start();
+					break;
+				
+			case 255:
+				break;
+			}
+		}
+		
+		if (emergency_brake_timeout)
+		{
+			motors.set_power(0, 0);
+			emergency_brake_timeout.cancel();
+		}
+
+		if (led_send_delay && !emergency_brake_timeout)
+		{
+			led_send_delay.restart();
 		}
 		
 		if(off_btn::read())
@@ -295,7 +341,6 @@ int main(void)
 		bluetooth_port.process_tx();
 		controller_port.process_tx();
 		position_sensor_port.process_tx();
-		driver_port.process_tx();
 		rs485.process_tx();
 	}
 }

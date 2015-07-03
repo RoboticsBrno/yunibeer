@@ -1,0 +1,5 @@
+syntax: glob
+*.atsuo
+Debug
+Release
+**.[bls]\#[1-9]

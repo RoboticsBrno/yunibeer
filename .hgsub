@@ -1,0 +1,3 @@
+fw/main_board/avrlib = http://technika.junior.cz/hg/avrlib
+fw/transmitter = http://technika.junior.cz/hg/yunibeer_transmitter
+hw/main_board = http://technika.junior.cz/hg/serial_hub

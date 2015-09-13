@@ -1,5 +1,6 @@
 /*
- * main_board.cpp
+ * Yunibeer
+ *     main_board.cpp
  *
  * Created: 6.10.2014 13:01:31
  *  Author: kubas
@@ -13,6 +14,7 @@
 #include <avr/pgmspace.h>
 
 #include "avrlib/xmega_pin.hpp"
+#include "avrlib/bootseq.hpp"
 #include "avrlib/sync_usart.hpp"
 #include "avrlib/async_usart.hpp"
 #include "avrlib/uart_xmega.hpp"
@@ -24,8 +26,10 @@
 #include "avrlib/stopwatch.hpp"
 #include "avrlib/math.hpp"
 #include "avrlib/pair.hpp"
+#include "avrlib/sequence_detector.hpp"
 
 #include "hw.hpp"
+#include "eeprom.hpp"
 
 using avrlib::format;
 using avrlib::format_spgm;
@@ -38,15 +42,17 @@ using avrlib::clamp;
 
 // usarts
 
-typedef avrlib::async_usart<avrlib::uart_xmega, 16, 128, avrlib::nobootseq, uint8_t> debug_port_type;
-debug_port_type debug;
-ISR(debug_usart_rxc_vect) { debug.intr_rx(); }
+#define bootseq avrlib::nobootseq
+
+typedef avrlib::async_usart<avrlib::uart_xmega, 16, 128, bootseq, uint8_t> debug_port_type;
+debug_port_type debug_port;
+ISR(debug_usart_rxc_vect) { debug_port.intr_rx(); }
 	
-typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, avrlib::nobootseq, uint8_t> bluetooth_port_type;
+typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, bootseq, uint8_t> bluetooth_port_type;
 bluetooth_port_type bluetooth_port;
 ISR(bluetooth_usart_rxc_vect) { bluetooth_port.intr_rx(); }
 	
-typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, avrlib::nobootseq, uint8_t> controller_port_type;
+typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, bootseq, uint8_t> controller_port_type;
 controller_port_type controller_port;
 ISR(controller_usart_rxc_vect) { controller_port.intr_rx(); }
 	
@@ -63,9 +69,112 @@ typedef avrlib::async_usart<avrlib::uart_xmega, 32, 32, avrlib::nobootseq, uint8
 rs485_type rs485;
 ISR(rs485_usart_rxc_vect) { rs485.intr_rx(); }
 
+template <typename main_port_type, typename redir1_type, typename redir2_type>
+class debug_t
+{
+public:
+	debug_t(main_port_type& main_port, redir1_type& redir1_port, redir2_type& redir2_port, uint8_t * const eeprom_addr)
+		:main_port(main_port), redir1_port(redir1_port), redir2_port(redir2_port), selected_port(0),
+		 selected_port_eeprom_addr(eeprom_addr), input_enable_seq("debug_in_en")
+	{}
+	void init() // has to be called after eeprom mapping
+	{
+		selected_port = *selected_port_eeprom_addr;
+	}
+	void redirect(const uint8_t& port_index)
+	{
+		selected_port = port_index;
+		*selected_port_eeprom_addr = selected_port;
+		flush_eeprom_page_buffer(selected_port_eeprom_addr);
+	}
+	uint8_t get_port_index() const
+	{
+		return selected_port;
+	}
+	void write(const char& ch)
+	{
+		main_port.write(ch);
+		switch(selected_port & 0x7F)
+		{
+			case  1: redir1_port.write(ch); break;
+			case  2: redir2_port.write(ch); break;
+		}
+	}
+	void process_tx()
+	{
+		main_port.process_tx();
+		switch(selected_port & 0x7F)
+		{
+			case  1: redir1_port.process_tx(); break;
+			case  2: redir2_port.process_tx(); break;
+		}
+	}
+	void flush()
+	{
+		main_port.flush();
+		switch(selected_port & 0x7F)
+		{
+			case  1: redir1_port.flush(); break;
+			case  2: redir2_port.flush(); break;
+		}
+	}
+	bool empty() const
+	{
+		if(!main_port.empty())
+			return false;
+		switch(selected_port)
+		{
+			case 0x01:
+			case 0x02: return false;
+			case 0x81: return redir1_port.empty();
+			case 0x82: return redir2_port.empty();
+			default:   return   main_port.empty();
+		}
+	}
+	char read()
+	{
+		if(!main_port.empty())
+			return main_port.read();
+		switch(selected_port)
+		{
+			case 0x01:
+				if(input_enable_seq(redir1_port.rx_buffer().top()))
+					selected_port |= 0x80;
+				return 0;
+			case 0x02:
+				if(input_enable_seq(redir2_port.rx_buffer().top()))
+					selected_port |= 0x80;
+				return 0;
+			case 0x81: return redir1_port.read();
+			case 0x82: return redir2_port.read();
+			default:   return   main_port.read();
+		}
+	}
+private:
+	main_port_type& main_port;
+	redir1_type& redir1_port;
+	redir2_type& redir2_port;
+	uint8_t selected_port;
+	uint8_t * const selected_port_eeprom_addr;
+	avrlib::sequence_detector_t<> input_enable_seq;
+};
+
+debug_t<debug_port_type, bluetooth_port_type, controller_port_type>
+	debug(debug_port, bluetooth_port, controller_port, debug_port_eeprom_addr);
+
+
+uint8_t ReadCalibrationByte(const uint8_t& index)
+{
+	NVM_CMD = NVM_CMD_READ_CALIB_ROW_gc;
+	uint8_t result = pgm_read_byte(index);
+	NVM_CMD = NVM_CMD_NO_OPERATION_gc;
+	return result;
+}
+
 
 #include "time.hpp"
 #include "roboclaw.hpp"
+#include "flyer_feeder.hpp"
 
 typedef led0_pin led0;
 
@@ -137,14 +246,19 @@ int main(void)
 		}
 	}
 	DFLLRC32M.CTRL = DFLL_ENABLE_bm;
+	
+	NVM.CTRLB = NVM_EEMAPEN_bm;
+	while((NVM.STATUS & NVM_NVMBUSY_bm) != 0){};
+		
+	debug.init();
 	    
-	debug.usart().open(debug_usart							, (-3<<12)|131, true);
-	bluetooth_port.usart().open(bluetooth_usart				, (-3<<12)|131, true); // 115200
+	debug_port.usart().open(debug_usart						, (-3<<12)|131, true); // 115200
+	bluetooth_port.usart().open(bluetooth_usart				, (-3<<12)|131, true);
 	controller_port.usart().open(controller_usart			, (-3<<12)|131, true);
 	position_sensor_port.usart().open(position_sensor_usart	, (-3<<12)|131, true);
+	rs485.usart().open(rs485_usart							, (-3<<12)|131, true);
 	driver_port.usart().open(driver_usart					, ( 2<<12)| 12, true); // 38400
 	driver_port.async_tx(true);
-	rs485.usart().open(rs485_usart							, (-3<<12)|131, true);
 	_delay_ms(1);
 	
 	format_spgm(debug, PSTR("\nYunibeer\n\tRST_STATUS = %x2\n")) % uint8_t(RST_STATUS);
@@ -193,6 +307,12 @@ int main(void)
 	
 	motors.set_pwm_resolution(motors.pwm_10bit);
 	
+	feeder_t<flyer_feeder_magnet_pin, flyer_feeder_sensor_led> feeder(
+		motor_t(flyer_feeder_motor_port, flyer_feeder_motor_gm),
+		magnet_t<flyer_feeder_magnet_pin>(),
+		optosensor_t<flyer_feeder_sensor_led>(flyer_feeder_threshold_eeprom_addr, flyer_feeder_sensor_channel));
+	button_t feed_button(1<<0);
+	
 	for(;;)
 	{
 		if(!debug.empty())
@@ -204,7 +324,7 @@ int main(void)
 					debug.write('\n');
 					break;
 					
-				case 1:
+				case 'i':
 					driver_port.write(128);
 					driver_port.write(21);
 					driver_port.flush();
@@ -227,16 +347,53 @@ int main(void)
 					}
 					break;
 					
-				case 2:
+				case 'O':
 					pwr_en::set_low();
 					for(;;);
+					
+				case 'A':
+				case 'B':
+				case 'C':
+					debug.redirect((ch - 'A') | 0x80);
+					break;
+					
+				case 'D':
+					debug.redirect(debug.get_port_index() & 0x7F);
+					break;
+					
+				case 'f':
+					feeder.feed();
+					break;
+					
+				case 'R':
+					feeder.reset();
+					break;
+					
+				case '+':
+					feeder.paper_sensor().increase_threshold();
+					format(debug, "pwm: % \n") % feeder.paper_sensor().get_threshold();
+					break;
+					
+				case '-':
+					feeder.paper_sensor().decrease_threshold();
+					format(debug, "pwm: % \n") % feeder.paper_sensor().get_threshold();
+					break;
+					
+				case 'E':
+					feeder.paper_sensor().save_threshold();
 					break;
 				
-				default:
-					bluetooth_port.write(ch);
+				case 'a':
+					feeder.automatic();
+					break;
+					
+				case 'm':
+					feeder.automatic(false);
 					break;
 			}
 		}
+		
+		led0::set_value(feeder.paper_sensor());
 		
 		if(!driver_port.empty())
 		{
@@ -286,6 +443,10 @@ int main(void)
 					motors.set_left_power ( left_target >> slowGetter/*, (buttons & 1) == 0*/);
 					motors.set_right_power(right_target >> slowGetter/*, (buttons & 1) == 0*/);
 					
+					feed_button.process(buttons);
+					if(feed_button.changed())
+						feeder.automatic(feed_button);
+					
 					emergency_brake_timeout.restart();
 				}
 				break;
@@ -303,6 +464,8 @@ int main(void)
 		{
 			motors.set_power(0, 0);
 			emergency_brake_timeout.cancel();
+			if(feed_button.changed())
+				feeder.automatic();
 		}
 
 		if (led_send_delay && !emergency_brake_timeout)
@@ -336,6 +499,8 @@ int main(void)
 			second_timeout.ack();
 			led1_pin::toggle();
 		}
+		
+		feeder.process();
 		
 		debug.process_tx();
 		bluetooth_port.process_tx();

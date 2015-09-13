@@ -87,7 +87,9 @@ AVRLIB_DEFINE_XMEGA_PIN(flyer_feeder_sensor_led, PORTC, 5);
 
 AVRLIB_DEFINE_XMEGA_PIN(flyer_feeder_magnet_pin, PORTC, 4);
 TC1_t& flyer_feeder_magnet_timer = TCC1;
+TC1_t& flyer_feeder_sensor_timer = TCC1;
 static const uint8_t flyer_feeder_magnet_timer_channel = 0;
+static const uint8_t flyer_feeder_sensor_timer_channel = 1;
 
 PORT_t& flyer_feeder_motor_port = PORTF;
 static const uint8_t flyer_feeder_motor_gp = 4;
